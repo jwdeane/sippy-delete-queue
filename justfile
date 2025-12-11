@@ -302,7 +302,7 @@ destroy-iam-user:
 [no-exit-message]
 list-r2:
     echo "Listing contents of R2 bucket {{ r2_bucket }}"
-    cfapi -s accounts/{{ cloudflare_account_id }}/r2/buckets/{{ r2_bucket }}/objects -XGET --json '{"limit":1000}' | jq '.result'
+    cfapi -s accounts/{{ cloudflare_account_id }}/r2/buckets/{{ r2_bucket }}/objects -XGET --json '{"limit":1000}' | jq -r '.result[].key'
 
 # list all objects in the S3 bucket
 [no-exit-message]
