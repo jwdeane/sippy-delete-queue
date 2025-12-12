@@ -1,0 +1,34 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "sippy-delete-queue",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-11-25",
+	"observability": {
+		"enabled": true,
+	},
+	"workers_dev": false,
+	"queues": {
+		"consumers": [
+			{
+				"queue": "sippy-delete-queue",
+				"max_batch_size": 10,
+				"max_batch_timeout": 5,
+				"max_retries": 5,
+			},
+		],
+	},
+	"r2_buckets": [
+		{
+			"binding": "BUCKET",
+			"bucket_name": "r2-sippy-delete-queue",
+		},
+	],
+	"vars": {
+		"AWS_REGION": "ap-southeast-2",
+		"S3_BUCKET_NAME": "s3-sippy-delete-queue",
+	},
+}

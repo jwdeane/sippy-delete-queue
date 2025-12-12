@@ -8,21 +8,21 @@ env_file := ".env"
 #--------------------------------------------------
 
 cloudflare_account_id := "1264dd6e6cc190c7c7527289dd3aa799"
-r2_bucket := "cflr-sippy-delete-queue-destination"
+r2_bucket := "r2-sippy-delete-queue"
 
 # AWS variables
 #--------------------------------------------------
 
 profile := "cflr-admin"
 iam_user := "cflr-sippy-delete-queue"
-s3_bucket := "cflr-sippy-delete-queue-source"
+s3_bucket := "s3-sippy-delete-queue"
 
 _default:
     just --list
 
-setup: create-r2-bucket create-s3-bucket create-iam-user create-r2-token enable-sippy
+setup: create-r2-bucket create-s3-bucket create-iam-user create-r2-token enable-sippy setup-queue upload-assets-to-s3
 
-teardown: delete-r2-bucket delete-r2-token delete-s3-bucket destroy-iam-user
+teardown: delete-s3-bucket destroy-iam-user teardown-queue delete-r2-bucket delete-r2-token
 
 create-r2-bucket:
     #!/usr/bin/env bash
@@ -34,6 +34,7 @@ create-r2-bucket:
 
     echo -e "\nEnabling r2.dev domain for bucket {{ r2_bucket }}"
     domain=$(cfapi -s accounts/{{ cloudflare_account_id }}/r2/buckets/{{ r2_bucket }}/domains/managed -XPUT --json '{"enabled": true}' | jq -r '.result.domain')
+    echo "$domain" > domain.txt
     echo "✔︎ enabled access at https://$domain"
 
 create-r2-token:
@@ -173,20 +174,32 @@ delete-r2-bucket:
         echo -e "✔︎ emptied {{ r2_bucket }} R2 bucket\n"
     elif grep -q "NoSuchBucket" <<<"$output"; then
         echo -e "✖︎ {{ r2_bucket }} R2 bucket not found"
-        exit 1
     else
         echo "$output"
         echo -e "✖︎ failed to empty {{ r2_bucket }} R2 bucket"
-        exit 1
     fi
 
     echo "Deleting R2 bucket {{ r2_bucket }}"
     response=$(cfapi -s accounts/{{ cloudflare_account_id }}/r2/buckets/{{ r2_bucket }} -XDELETE)
     if jq -e '.success == true' >/dev/null <<<"$response"; then
+        rm -f domain.txt
         echo "✔︎ deleted {{ r2_bucket }} R2 bucket"
     else
         echo -e "✖︎ {{ r2_bucket }} R2 bucket not found"
-        exit 1
+    fi
+
+empty-r2-bucket:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    echo "Emptying R2 bucket {{ r2_bucket }}"
+    if output=$(AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY aws s3 rm s3://{{ r2_bucket }} --region auto --recursive --endpoint-url https://{{ cloudflare_account_id }}.r2.cloudflarestorage.com 2>&1); then
+        echo -e "✔︎ emptied {{ r2_bucket }} R2 bucket\n"
+    elif grep -q "NoSuchBucket" <<<"$output"; then
+        echo -e "✖︎ {{ r2_bucket }} R2 bucket not found"
+    else
+        echo "$output"
+        echo -e "✖︎ failed to empty {{ r2_bucket }} R2 bucket"
     fi
 
 [no-exit-message]
@@ -238,7 +251,7 @@ create-iam-user:
           "Statement": [
             {
               "Effect": "Allow",
-              "Action": ["s3:ListBucket*", "s3:GetObject*"],
+              "Action": ["s3:ListBucket*", "s3:GetObject*", "s3:DeleteObject*"],
               "Resource": [("arn:aws:s3:::" + $bucket), ("arn:aws:s3:::" + $bucket + "/*")]
             }
           ]
@@ -298,6 +311,14 @@ destroy-iam-user:
 
     echo "✔︎ cleanup complete"
 
+upload-assets-to-s3:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    echo "Uploading assets to s3://{{ s3_bucket }}"
+    aws s3 cp "{{ justfile_directory() }}/assets/" "s3://{{ s3_bucket }}/" --recursive --profile {{ profile }}
+    echo "✔︎ uploaded assets to s3://{{ s3_bucket }}"
+
 # list all onjects in the R2 bucket
 [no-exit-message]
 list-r2:
@@ -309,3 +330,76 @@ list-r2:
 list-s3:
     echo "Listing contents of s3://{{ s3_bucket }}"
     aws s3 ls s3://{{ s3_bucket }} --recursive --profile {{ profile }}
+
+trigger-sippy:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    domain="$(cat domain.txt)"
+    for asset in assets/*; do
+        asset_name="$(basename "$asset")"
+        asset_url="${domain}/${asset_name}"
+        echo "Sipping https://${asset_url}"
+        curl -so /dev/null "https://$asset_url"
+    done
+
+delete-r2-object key:
+    npx wrangler r2 object delete {{ r2_bucket }}/{{ key }} --remote
+
+delete-s3-object key:
+    aws s3 rm s3://{{ s3_bucket }}/{{ key }}
+
+# Workers
+#--------------------------------------------------
+
+setup-queue: create-r2-queue create-r2-notification deploy-worker add-secrets
+
+teardown-queue: delete-r2-notification delete-r2-queue delete-worker
+
+deploy-worker:
+    cd {{ justfile_directory() }}/consumer-worker && npx wrangler deploy
+
+delete-worker:
+    cd {{ justfile_directory() }}/consumer-worker && npx wrangler delete
+
+create-r2-queue:
+    cd {{ justfile_directory() }}/consumer-worker && npx wrangler queues create {{ demo_name }}
+
+delete-r2-queue:
+    cd {{ justfile_directory() }}/consumer-worker && npx wrangler queues delete {{ demo_name }}
+
+create-r2-notification:
+    cd {{ justfile_directory() }}/consumer-worker && npx wrangler r2 bucket notification create {{ r2_bucket }} --event-type object-create --queue {{ demo_name }}
+
+delete-r2-notification:
+    cd {{ justfile_directory() }}/consumer-worker && npx wrangler r2 bucket notification delete {{ r2_bucket }} --queue {{ demo_name }}
+
+add-secrets:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    aws_access_key_id=$(grep "^AWS_ACCESS_KEY_ID=" {{ env_file }} | cut -d'=' -f2)
+    aws_secret_access_key=$(grep "^AWS_SECRET_ACCESS_KEY=" {{ env_file }} | cut -d'=' -f2)
+
+    echo "Adding AWS_ACCESS_KEY_ID secret to {{ demo_name }} Worker"
+    cfapi -s accounts/{{ cloudflare_account_id }}/workers/scripts/{{ demo_name }}/secrets \
+        -X PUT \
+        --json "{
+            \"name\": \"AWS_ACCESS_KEY_ID\",
+            \"text\": \"${aws_access_key_id}\",
+            \"type\": \"secret_text\"
+            }"
+
+    echo "Adding AWS_SECRET_ACCESS_KEY secret to {{ demo_name }} Worker"
+    cfapi -s accounts/{{ cloudflare_account_id }}/workers/scripts/{{ demo_name }}/secrets \
+        -X PUT \
+        --json "{
+            \"name\": \"AWS_SECRET_ACCESS_KEY\",
+            \"text\": \"${aws_secret_access_key}\",
+            \"type\": \"secret_text\"
+            }"
+
+    echo "✔︎ added AWS secrets to {{ demo_name }} Worker"
+
+reset-demo: empty-r2-bucket upload-assets-to-s3
+    echo "✔︎ demo reset complete"
